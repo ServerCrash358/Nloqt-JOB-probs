@@ -1,0 +1,516 @@
+"""
+T1 RELAXOMETRY SENSING SIMULATION: Paramagnetic Species Detection
+Advanced simulation of T1 relaxation with magnetic noise modeling
+
+Author: Quantum Sensing Laboratory
+Reference: Niora et al. (2026) J. Phys. Photonics 8 012007
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from dataclasses import dataclass
+from typing import Tuple, Dict, List
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# SECTION 1: Physical Constants and Parameters
+# =============================================================================
+
+@dataclass
+class T1RelaxometryParams:
+    """Physical parameters for T1 relaxometry"""
+    
+    # NV center properties
+    gamma_e = 1.76e11  # rad/(s·T), electron gyromagnetic ratio
+    D_gs = 2.87e9      # Hz, ground state zero-field splitting
+    hbar = 1.055e-34   # J·s, reduced Planck constant
+    k_B = 1.38e-23     # J/K, Boltzmann constant
+    
+    # NV sensor in diamond
+    T1_intrinsic = 1e-3  # s, intrinsic T1 (no external paramagnetic spins)
+    T2 = 50e-6           # s, transverse relaxation time
+    n_NV = 2.5           # ppm, typical NV concentration in FND
+    NV_depth = 10e-9     # m, typical depth below surface
+    contrast = 0.03      # 3% ODMR contrast for ensemble
+    photon_rate = 1e5    # photons/s, fluorescence photon emission rate
+    
+    # Magnetic constants
+    mu_B = 9.284764e-24  # J/T, Bohr magneton
+    mu_0 = 4e-7 * np.pi  # T·m/A, permeability of free space
+
+
+class ParamagneticSpecies:
+    """
+    Model paramagnetic species (Gd3+, free radicals, P1 centers)
+    and their magnetic noise contributions
+    """
+    
+    def __init__(self, species_type: str = "Gd3+"):
+        """Initialize paramagnetic species"""
+        self.species_type = species_type
+        self.set_species_params()
+    
+    def set_species_params(self):
+        """Set magnetic parameters based on species type"""
+        if self.species_type == "Gd3+":
+            self.spin_quantum_number = 7/2      # S = 7/2
+            self.magnetic_moment = 7 * 9.284764e-24  # 7 μB
+            self.correlation_time = 1e-9        # s, typical hydration time
+            self.g_factor = 2.0
+            self.name = "Gd³⁺ ion"
+            
+        elif self.species_type == "free_radical":
+            self.spin_quantum_number = 1/2      # S = 1/2
+            self.magnetic_moment = 1 * 9.284764e-24  # 1 μB
+            self.correlation_time = 1e-10       # s, faster dynamics
+            self.g_factor = 2.0
+            self.name = "Free Radical"
+            
+        elif self.species_type == "P1_center":
+            self.spin_quantum_number = 1/2      # S = 1/2
+            self.magnetic_moment = 1 * 9.284764e-24
+            self.correlation_time = 1e-6        # s, static defect
+            self.g_factor = 2.0
+            self.name = "P1 Center"
+        
+        else:
+            raise ValueError(f"Unknown species type: {self.species_type}")
+
+
+class T1RelaxometrySimulator:
+    """Simulate T1 relaxometry sensing with realistic pulse sequences and noise modeling"""
+    
+    def __init__(self, params: T1RelaxometryParams = None):
+        self.params = params or T1RelaxometryParams()
+    
+    def compute_T1_effective(self, 
+                             C_param: float,
+                             species: ParamagneticSpecies,
+                             distance: float = None) -> Tuple[float, float]:
+        """Compute effective T1 relaxation time with paramagnetic perturbation"""
+        
+        mu_B = self.params.mu_B
+        mu_0 = self.params.mu_0
+        gamma_e = self.params.gamma_e
+        hbar = self.params.hbar
+        
+        if distance is None:
+            distance = self.params.NV_depth + 2e-9  # 2 nm offset to analyte
+        
+        # Compute magnetic noise power spectral density
+        omega_0 = 2 * np.pi * self.params.D_gs
+        J_omega = species.correlation_time / (1 + (omega_0 * species.correlation_time)**2)
+        
+        # Dipolar coupling constant
+        C_dip = (mu_0 / (4 * np.pi))**2 * gamma_e**4 * hbar**2 * species.magnetic_moment**2
+        
+        # Magnetic noise contribution (Born approximation)
+        Gamma_param = (8/15) * C_dip * (1 / distance**6) * J_omega * C_param
+        
+        # Total relaxation rate
+        Gamma_total = (1 / self.params.T1_intrinsic) + Gamma_param
+        T1_eff = 1 / Gamma_total
+        
+        return T1_eff, Gamma_param
+    
+    def concentration_to_t1(self, 
+                           C_range: np.ndarray,
+                           species_type: str = "Gd3+") -> Tuple[np.ndarray, np.ndarray]:
+        """Compute T1 as function of paramagnetic concentration"""
+        
+        species = ParamagneticSpecies(species_type)
+        T1_values = np.zeros_like(C_range)
+        Gamma_values = np.zeros_like(C_range)
+        
+        for i, C in enumerate(C_range):
+            T1_eff, Gamma_param = self.compute_T1_effective(C, species)
+            T1_values[i] = T1_eff
+            Gamma_values[i] = Gamma_param
+            
+        return T1_values, Gamma_values
+    
+    def simulate_pulse_sequence(self,
+                               T1_eff: float,
+                               tau_array: np.ndarray,
+                               protocol: str = "all_optical",
+                               noise_level: float = 0.02) -> Dict:
+        """Simulate T1 measurement pulse sequence"""
+        
+        P_0_init = 1.0  # Initial state in ms=0
+        P_eq = 1.0 / 3.0  # Equilibrium population (1/3 for each sublevel)
+        
+        F_bright = self.params.photon_rate  
+        F_dark = self.params.photon_rate * 0.5  
+        
+        fluorescence = np.zeros_like(tau_array)
+        fluorescence_noisy = np.zeros_like(tau_array)
+        populations = np.zeros((len(tau_array), 3))
+        
+        for i, tau in enumerate(tau_array):
+            if protocol == "all_optical":
+                P_0_tau = P_eq + (P_0_init - P_eq) * np.exp(-tau / T1_eff)
+                
+            elif protocol == "MW_assisted":
+                P_0_tau = P_eq + (P_0_init - P_eq) * np.exp(-tau / T1_eff)
+                P_0_tau_pi = P_eq - (P_0_init - P_eq) * np.exp(-tau / T1_eff)
+                P_0_tau = (P_0_tau + P_0_tau_pi) / 2.0
+            else:
+                raise ValueError(f"Unknown protocol: {protocol}")
+            
+            F_tau = F_bright * P_0_tau + F_dark * (1 - P_0_tau)
+            
+            shot_noise = np.sqrt(max(F_tau, 1)) * noise_level
+            F_tau_noisy = F_tau + np.random.normal(0, shot_noise)
+            
+            fluorescence[i] = F_tau
+            fluorescence_noisy[i] = F_tau_noisy
+            populations[i] = [P_0_tau, (1 - P_0_tau)/2, (1 - P_0_tau)/2]
+        
+        F_min = np.min(fluorescence)
+        F_max = np.max(fluorescence)
+        F_contrast = (fluorescence - F_min) / (F_max - F_min + 1e-10)
+        F_contrast_noisy = (fluorescence_noisy - F_min) / (F_max - F_min + 1e-10)
+        
+        return {
+            'tau_array': tau_array,
+            'fluorescence_ideal': fluorescence,
+            'fluorescence_noisy': fluorescence_noisy,
+            'fluorescence_contrast': F_contrast,
+            'fluorescence_contrast_noisy': F_contrast_noisy,
+            'populations': populations,
+            'T1_true': T1_eff,
+            'protocol': protocol
+        }
+    
+    def fit_T1(self, tau_array: np.ndarray, 
+              fluorescence_data: np.ndarray,
+              initial_guess: float = None) -> Dict:
+        """Extract T1 from fluorescence decay curve using robust fitting"""
+        
+        if initial_guess is None:
+            initial_guess = 1e-3
+            
+        def exponential_model(tau, A, T1_fit, C):
+            return A * np.exp(-tau / T1_fit) + C
+            
+        p0 = [np.max(fluorescence_data) - np.min(fluorescence_data),
+              initial_guess,
+              np.min(fluorescence_data)]
+              
+        try:
+            popt, pcov = curve_fit(
+                exponential_model,
+                tau_array,
+                fluorescence_data,
+                p0=p0,
+                bounds=([0, 1e-7, -np.inf], [np.inf, 1e-1, np.inf]),
+                maxfev=10000
+            )
+            
+            A_fit, T1_fit, C_fit = popt
+            perr = np.sqrt(np.diag(pcov))
+            T1_uncertainty = perr[1]
+            
+            residuals = fluorescence_data - exponential_model(tau_array, *popt)
+            chi_squared = np.sum(residuals**2) / len(residuals)
+            
+            ss_res = np.sum(residuals**2)
+            ss_tot = np.sum((fluorescence_data - np.mean(fluorescence_data))**2)
+            r_squared = 1 - (ss_res / ss_tot)
+            
+        except:
+            T1_fit = initial_guess
+            T1_uncertainty = initial_guess * 0.2
+            chi_squared = np.inf
+            r_squared = 0
+            residuals = np.zeros_like(fluorescence_data)
+            
+        return {
+            'T1_fitted': T1_fit,
+            'T1_uncertainty': T1_uncertainty,
+            'chi_squared': chi_squared,
+            'r_squared': r_squared,
+            'residuals': residuals,
+            'fit_quality': 'good' if r_squared > 0.95 else 'fair' if r_squared > 0.85 else 'poor'
+        }
+    
+    def concentration_sweep(self,
+                           species_type: str = "Gd3+",
+                           C_range: np.ndarray = None,
+                           tau_array: np.ndarray = None) -> Dict:
+        """Perform concentration sweep simulation"""
+        
+        if C_range is None:
+            C_range = np.logspace(-9, -3, 50)
+        if tau_array is None:
+            tau_array = np.logspace(-6, -2, 200)
+            
+        species = ParamagneticSpecies(species_type)
+        
+        results = {
+            'C_range': C_range,
+            'tau_array': tau_array,
+            'species_type': species_type,
+            'T1_optical': [],
+            'T1_mw': [],
+            'err_optical': [],
+            'err_mw': [],
+            'delta_T1': [],
+            'sensitivity': []
+        }
+        
+        for C in C_range:
+            T1_eff, _ = self.compute_T1_effective(C, species)
+            
+            sim_opt = self.simulate_pulse_sequence(T1_eff, tau_array, protocol="all_optical")
+            fit_opt = self.fit_T1(tau_array, sim_opt['fluorescence_contrast_noisy'])
+            
+            sim_mw = self.simulate_pulse_sequence(T1_eff, tau_array, protocol="MW_assisted")
+            fit_mw = self.fit_T1(tau_array, sim_mw['fluorescence_contrast_noisy'])
+            
+            results['T1_optical'].append(fit_opt['T1_fitted'])
+            results['T1_mw'].append(fit_mw['T1_fitted'])
+            results['err_optical'].append(fit_opt['T1_uncertainty'])
+            results['err_mw'].append(fit_mw['T1_uncertainty'])
+            
+            delta_t1 = (self.params.T1_intrinsic - T1_eff) / self.params.T1_intrinsic
+            results['delta_T1'].append(delta_t1)
+            
+            if C > 1e-10:
+                sensitivity = delta_t1 / (np.log10(C) + 9)
+                results['sensitivity'].append(sensitivity)
+            else:
+                results['sensitivity'].append(0)
+                
+        for key in ['T1_optical', 'T1_mw', 'err_optical', 'err_mw', 'delta_T1', 'sensitivity']:
+            results[key] = np.array(results[key])
+            
+        return results
+    
+    def protein_corona_effect(self,
+                             C_param: float,
+                             species: ParamagneticSpecies,
+                             protein_concentration: float = 1.0,
+                             corona_thickness: float = 2e-9) -> Tuple[float, float]:
+        """Model protein corona degradation of sensing"""
+        
+        T1_clean, _ = self.compute_T1_effective(C_param, species)
+        
+        r_clean = self.params.NV_depth + 2e-9
+        r_effective = r_clean + corona_thickness
+        scaling_factor = (r_clean / r_effective)**6
+        
+        omega_0 = 2 * np.pi * self.params.D_gs
+        J_omega = species.correlation_time / (1 + (omega_0 * species.correlation_time)**2)
+        C_dip = (self.params.mu_0 / (4 * np.pi))**2 * self.params.gamma_e**4 * self.params.hbar**2 * species.magnetic_moment**2
+        
+        Gamma_param_clean = (8/15) * C_dip * (1 / r_clean**6) * J_omega * C_param
+        Gamma_param_corona = Gamma_param_clean * scaling_factor
+        
+        Gamma_total_corona = (1 / self.params.T1_intrinsic) + Gamma_param_corona
+        T1_corona = 1 / Gamma_total_corona
+        
+        return T1_clean, T1_corona
+
+
+# =============================================================================
+# SECTION 2: Visualization Functions
+# =============================================================================
+
+def plot_concentration_response(simulator: T1RelaxometrySimulator,
+                               species_types: List[str] = None,
+                               save_path: str = None):
+    """Create publication-quality plots of concentration response"""
+    
+    if species_types is None:
+        species_types = ["Gd3+", "free_radical", "P1_center"]
+        
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), dpi=150)
+    C_range = np.logspace(-9, -3, 50)
+    
+    for idx, species_type in enumerate(species_types):
+        T1_values, Gamma_values = simulator.concentration_to_t1(C_range, species_type)
+        
+        axes[0, idx].loglog(C_range, T1_values * 1e3, 'o-', linewidth=2.5,
+                           markersize=6, color='darkblue', label='T₁ (measured)')
+        axes[0, idx].axhline(y=simulator.params.T1_intrinsic * 1e3, color='gray',
+                           linestyle='--', linewidth=2, alpha=0.7, label='T₁ intrinsic')
+        axes[0, idx].set_xlabel('Concentration (mol/m³)', fontsize=11)
+        axes[0, idx].set_ylabel('T₁ (ms)', fontsize=11)
+        axes[0, idx].set_title(f'{species_type} - T₁ Response', fontsize=12, fontweight='bold')
+        axes[0, idx].grid(True, alpha=0.3, which='both')
+        axes[0, idx].legend(fontsize=10)
+        
+        axes[1, idx].loglog(C_range, Gamma_values, 's-', linewidth=2.5,
+                           markersize=6, color='darkred', label='Γ_param')
+        axes[1, idx].set_xlabel('Concentration (mol/m³)', fontsize=11)
+        axes[1, idx].set_ylabel('Magnetic Noise Γ (Hz)', fontsize=11)
+        axes[1, idx].set_title(f'{species_type} - Noise Contribution', fontsize=12, fontweight='bold')
+        axes[1, idx].grid(True, alpha=0.3, which='both')
+        axes[1, idx].legend(fontsize=10)
+        
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    return fig, axes
+
+
+def plot_t1_decay_curves(simulator: T1RelaxometrySimulator,
+                        C_values: List[float] = None,
+                        save_path: str = None):
+    """Plot T1 relaxation decay curves for different concentrations"""
+    
+    if C_values is None:
+        C_values = [1e-9, 1e-7, 1e-5, 1e-3]
+        
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), dpi=150)
+    axes = axes.flatten()
+    
+    species = ParamagneticSpecies("Gd3+")
+    tau_array = np.logspace(-6, -2, 100)
+    colors = plt.cm.RdYlGn(np.linspace(0, 1, len(C_values)))
+    
+    for idx, C in enumerate(C_values):
+        T1_eff, _ = simulator.compute_T1_effective(C, species)
+        sim_result = simulator.simulate_pulse_sequence(T1_eff, tau_array, protocol="all_optical")
+        
+        ax = axes[idx]
+        ax.plot(tau_array * 1e6, sim_result['fluorescence_contrast'],
+               'o-', linewidth=2, markersize=4, color=colors[idx],
+               label=f'No noise (T₁={T1_eff*1e3:.2f} ms)', alpha=0.7)
+        ax.plot(tau_array * 1e6, sim_result['fluorescence_contrast_noisy'],
+               'x', markersize=5, color=colors[idx], alpha=0.5,
+               label=f'With noise (C={C:.1e} mol/m³)')
+        
+        fit_result = simulator.fit_T1(tau_array, sim_result['fluorescence_contrast_noisy'])
+        fitted_curve = 1.0 * np.exp(-tau_array / fit_result['T1_fitted'])
+        
+        ax.plot(tau_array * 1e6, fitted_curve, '--', linewidth=2, color=colors[idx], 
+                label=f'Fit: T₁={fit_result["T1_fitted"]*1e3:.2f}±{fit_result["T1_uncertainty"]*1e3:.2f} ms')
+        
+        ax.set_xlabel('Delay Time τ (μs)', fontsize=11)
+        ax.set_ylabel('Fluorescence Contrast', fontsize=11)
+        ax.set_title(f'T₁ Decay Curve (C = {C:.1e})', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9)
+        ax.set_xscale('log')
+        
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    return fig, axes
+
+
+def plot_protein_corona_effect(simulator: T1RelaxometrySimulator, save_path: str = None):
+    """Visualize degradation of sensing due to protein corona formation"""
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=150)
+    species = ParamagneticSpecies("Gd3+")
+    C_range = np.logspace(-9, -3, 50)
+    
+    T1_clean_values = []
+    T1_corona_values = []
+    sensitivity_loss = []
+    
+    for C in C_range:
+        T1_clean, T1_corona = simulator.protein_corona_effect(C, species, corona_thickness=2e-9)
+        T1_clean_values.append(T1_clean)
+        T1_corona_values.append(T1_corona)
+        loss = (T1_clean - T1_corona) / T1_clean
+        sensitivity_loss.append(loss)
+        
+    T1_clean_values, T1_corona_values, sensitivity_loss = np.array(T1_clean_values), np.array(T1_corona_values), np.array(sensitivity_loss)
+    
+    axes[0].loglog(C_range, T1_clean_values * 1e3, 'o-', linewidth=2.5,
+                  markersize=6, label='No protein corona', color='darkgreen')
+    axes[0].loglog(C_range, T1_corona_values * 1e3, 's-', linewidth=2.5,
+                  markersize=6, label='With protein corona', color='darkred')
+    axes[0].fill_between(C_range, T1_clean_values * 1e3, T1_corona_values * 1e3,
+                        alpha=0.2, color='orange', label='Sensitivity loss')
+    axes[0].axhline(y=simulator.params.T1_intrinsic * 1e3, color='gray',
+                   linestyle='--', alpha=0.5, label='Baseline T₁')
+    axes[0].set_xlabel('Gd³⁺ Concentration (mol/m³)', fontsize=12)
+    axes[0].set_ylabel('T₁ (ms)', fontsize=12)
+    axes[0].set_title('Effect of Protein Corona on T₁', fontsize=13, fontweight='bold')
+    axes[0].grid(True, alpha=0.3, which='both')
+    axes[0].legend(fontsize=10)
+    
+    axes[1].semilogx(C_range, sensitivity_loss * 100, 'o-', linewidth=2.5,
+                    markersize=6, color='darkviolet')
+    axes[1].fill_between(C_range, 0, sensitivity_loss * 100, alpha=0.3, color='violet')
+    axes[1].set_xlabel('Gd³⁺ Concentration (mol/m³)', fontsize=12)
+    axes[1].set_ylabel('Sensitivity Loss (%)', fontsize=12)
+    axes[1].set_title('Quantitative Sensitivity Degradation', fontsize=13, fontweight='bold')
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    return fig, axes
+
+
+# =============================================================================
+# SECTION 3: Main Execution
+# =============================================================================
+
+if __name__ == "__main__":
+    print("=" * 80)
+    print("T1 RELAXOMETRY SIMULATION: PARAMAGNETIC SPECIES DETECTION")
+    print("=" * 80)
+    
+    simulator = T1RelaxometrySimulator()
+    
+    print("\n[1] COMPUTING CONCENTRATION RESPONSE...")
+    for species_type in ["Gd3+", "free_radical", "P1_center"]:
+        print(f"\n    Processing {species_type}...")
+        C_range = np.logspace(-9, -3, 10)
+        T1_values, _ = simulator.concentration_to_t1(C_range, species_type)
+        print(f"      Baseline T₁: {simulator.params.T1_intrinsic*1e3:.2f} ms")
+        print(f"      T₁ @ 1 nM: {T1_values[0]*1e3:.3f} ms")
+        print(f"      T₁ @ 1 μM: {T1_values[5]*1e3:.3f} ms")
+        print(f"      T₁ @ 1 mM: {T1_values[-1]*1e3:.3f} ms")
+    
+    print("\n[2] SIMULATING PULSE SEQUENCES...")
+    species = ParamagneticSpecies("Gd3+")
+    C_test = 1e-6
+    T1_test, _ = simulator.compute_T1_effective(C_test, species)
+    tau_array = np.logspace(-6, -2, 100)
+    
+    sim_optical = simulator.simulate_pulse_sequence(T1_test, tau_array, protocol="all_optical")
+    fit_optical = simulator.fit_T1(tau_array, sim_optical['fluorescence_contrast_noisy'])
+    
+    sim_mw = simulator.simulate_pulse_sequence(T1_test, tau_array, protocol="MW_assisted")
+    fit_mw = simulator.fit_T1(tau_array, sim_mw['fluorescence_contrast_noisy'])
+    
+    print(f"\n    True T₁: {T1_test*1e3:.3f} ms")
+    print(f"    All-optical fit: {fit_optical['T1_fitted']*1e3:.3f} ± {fit_optical['T1_uncertainty']*1e3:.3f} ms (R²={fit_optical['r_squared']:.3f})")
+    
+    print("\n[3] PERFORMING CONCENTRATION SWEEP...")
+    results_gd = simulator.concentration_sweep(species_type="Gd3+")
+    print(f"    ✓ Sweep complete ({len(results_gd['C_range'])} concentrations)")
+    
+    print("\n[4] ASSESSING PROTEIN CORONA EFFECTS...")
+    T1_clean, T1_corona = simulator.protein_corona_effect(C_test, species)
+    sensitivity_loss = (T1_clean - T1_corona) / T1_clean * 100
+    print(f"    T₁ without corona: {T1_clean*1e3:.3f} ms")
+    print(f"    T₁ with corona: {T1_corona*1e3:.3f} ms")
+    print(f"    Sensitivity loss: {sensitivity_loss:.1f}%")
+    
+    print("\n[5] GENERATING PUBLICATION-QUALITY FIGURES...")
+    plot_concentration_response(simulator, save_path='./04_T1_Concentration_Response.png')
+    print("    ✓ Saved: ./04_T1_Concentration_Response.png")
+    
+    plot_t1_decay_curves(simulator, save_path='./05_T1_Decay_Curves.png')
+    print("    ✓ Saved: ./05_T1_Decay_Curves.png")
+    
+    plot_protein_corona_effect(simulator, save_path='./06_Protein_Corona_Effect.png')
+    print("    ✓ Saved: ./06_Protein_Corona_Effect.png")
+    
+    print("\n" + "=" * 80)
+    print("SIMULATION COMPLETE")
+    print("=" * 80)
+    
+    plt.show()
